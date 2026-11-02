@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from openproxy import __version__
 from openproxy.api.routes import health_router, v1_router
 from openproxy.core.config import AppConfig, load_config
+from openproxy.core.logging import configure_logging
 
 EXTERNAL_WARNING = (
     "OpenProxy is listening on a non-loopback interface. The management API has "
@@ -26,12 +27,17 @@ def create_app(
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         active = config if config is not None else load_config(config_path)
+        configure_logging(active.logging)
+        logger = logging.getLogger("openproxy.server")
+        logger.info("Server starting")
         application.state.config = active
         if not active.server.is_loopback:
             logging.getLogger("openproxy").warning(EXTERNAL_WARNING)
         try:
+            logger.info("Server ready")
             yield
         finally:
+            logger.info("Server stopped")
             del application.state.config
 
     application = FastAPI(

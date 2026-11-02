@@ -4,7 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
-from openproxy.core.config import AppConfig
+from openproxy.core.config import AppConfig, LoggingConfig
 
 
 class HealthResponse(BaseModel):
@@ -30,10 +30,12 @@ class PublicServerConfig(BaseModel):
 
 class ConfigResponse(BaseModel):
     server: PublicServerConfig
+    logging: LoggingConfig
 
 
 def public_config(config: AppConfig) -> ConfigResponse:
     """Do not automatically expose future credentials or local file paths."""
     return ConfigResponse(
-        server=PublicServerConfig(host=config.server.host, port=config.server.port)
+        server=PublicServerConfig(host=config.server.host, port=config.server.port),
+        logging=LoggingConfig(level=config.logging.level, format=config.logging.format),
     )

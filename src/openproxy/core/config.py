@@ -3,6 +3,7 @@
 import os
 from ipaddress import ip_address
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -46,10 +47,18 @@ class ServerConfig(BaseModel):
         return f"http://{host}:{self.port}/health"
 
 
+class LoggingConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    format: Literal["text", "json"] = "text"
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
     server: ServerConfig = Field(default_factory=ServerConfig)
+    logging: LoggingConfig = Field(default_factory=LoggingConfig)
 
 
 def resolve_config_path(file_path: str | Path | None = None) -> Path | None:

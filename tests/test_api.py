@@ -30,7 +30,10 @@ def test_api_and_lifespan() -> None:
         assert info["proxy_implemented"] is False
         response = client.get("/api/v1/config")
         assert response.status_code == 200
-        assert response.json() == {"server": {"host": "127.0.0.1", "port": 9000}}
+        assert response.json() == {
+            "server": {"host": "127.0.0.1", "port": 9000},
+            "logging": {"level": "INFO", "format": "text"},
+        }
         assert client.get("/").json()["name"] == "OpenProxy"
         schema = client.get("/openapi.json").json()
         assert schema["info"]["version"] == __version__
@@ -63,11 +66,12 @@ def test_invalid_config_fails_startup(tmp_path: Path) -> None:
         pytest.fail("Invalid configuration must prevent startup")
 
 
-def test_external_interface_warning(caplog: pytest.LogCaptureFixture) -> None:
+def test_external_interface_warning(capsys: pytest.CaptureFixture[str]) -> None:
     config = AppConfig(server=ServerConfig(host="0.0.0.0"))
     with TestClient(create_app(config)):
-        assert "no authentication" in caplog.text
-        assert "protect access" in caplog.text
+        output = capsys.readouterr().err
+        assert "no authentication" in output
+        assert "protect access" in output
 
 
 def test_default_has_no_external_warning(caplog: pytest.LogCaptureFixture) -> None:

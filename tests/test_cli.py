@@ -36,7 +36,7 @@ def mock_http(
 def test_version() -> None:
     result = runner.invoke(cli.app, ["version"])
     assert result.exit_code == 0
-    assert __version__ == "0.2.0"
+    assert __version__ == "0.2.1"
     assert __version__ in result.output
 
 
@@ -49,7 +49,8 @@ def test_config_commands(tmp_path: Path) -> None:
     result = runner.invoke(cli.app, ["config", "show", "-c", str(path)])
     assert result.exit_code == 0
     assert yaml.safe_load(result.output) == {
-        "server": {"host": "127.0.0.1", "port": 9010}
+        "server": {"host": "127.0.0.1", "port": 9010},
+        "logging": {"level": "INFO", "format": "text"},
     }
 
 
@@ -166,7 +167,13 @@ def test_start_uses_same_config(
     monkeypatch.setattr(uvicorn, "run", run)
     result = runner.invoke(cli.app, ["start", "--config", str(path)])
     assert result.exit_code == 0
-    assert run.call_args.kwargs == {
+    assert run.call_args.kwargs["access_log"] is False
+    assert "log_config" in run.call_args.kwargs
+    assert {
+        k: v
+        for k, v in run.call_args.kwargs.items()
+        if k not in {"log_config", "access_log"}
+    } == {
         "host": "127.0.0.1",
         "port": 9020,
         "reload": False,
@@ -207,6 +214,8 @@ def test_reload_absolute_path(
 
     def run(target: str, **kwargs: Any) -> None:
         assert target == "openproxy.main:create_app"
+        assert kwargs.pop("access_log") is False
+        assert kwargs.pop("log_config")["version"] == 1
         assert kwargs == {
             "factory": True,
             "reload": True,

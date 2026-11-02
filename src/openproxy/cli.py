@@ -1,4 +1,8 @@
+import logging
 import os
+import platform
+import sys
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Annotated
 
@@ -16,6 +20,8 @@ from openproxy.core.config import (
     load_config,
     resolve_config_path,
 )
+from openproxy.core.diagnostics import Check, check_address, check_port
+from openproxy.core.logging import LEVEL_ENV, configure_logging, logging_config
 from openproxy.main import create_app
 
 app = typer.Typer(no_args_is_help=True)
@@ -26,9 +32,47 @@ ConfigOption = Annotated[
 ]
 
 
+quiet_mode: ContextVar[bool] = ContextVar("quiet", default=False)
+
+
+@app.callback()
+def options(
+    ctx: typer.Context,
+    verbose: Annotated[
+        bool, typer.Option("--verbose", help="Enable DEBUG logs.")
+    ] = False,
+    quiet: Annotated[
+        bool, typer.Option("--quiet", help="Only warnings and errors.")
+    ] = False,
+) -> None:
+    if verbose and quiet:
+        raise typer.BadParameter("--verbose and --quiet are mutually exclusive")
+    token = quiet_mode.set(quiet)
+    ctx.call_on_close(lambda: quiet_mode.reset(token))
+    previous = os.environ.get(LEVEL_ENV)
+    if verbose or quiet:
+        os.environ[LEVEL_ENV] = "DEBUG" if verbose else "WARNING"
+
+    def restore() -> None:
+        if previous is None:
+            os.environ.pop(LEVEL_ENV, None)
+        else:
+            os.environ[LEVEL_ENV] = previous
+
+    ctx.call_on_close(restore)
+
+
+def echo(message: str) -> None:
+    if not quiet_mode.get():
+        typer.echo(message)
+
+
 def _load_config(path: Path | None) -> AppConfig:
     try:
-        return load_config(path)
+        active = load_config(path)
+        configure_logging(active.logging)
+        logging.getLogger("openproxy.cli").debug("Configuration validated")
+        return active
     except ConfigError as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=2) from None
@@ -57,7 +101,7 @@ def version() -> None:
 def status(config: ConfigOption = None) -> None:
     """Check the configured instance (exit 1 when unavailable)."""
     if is_running(_load_config(config)):
-        typer.echo("OpenProxy is running")
+        echo("OpenProxy is running")
     else:
         typer.echo("OpenProxy is not running or the service is not OpenProxy")
         raise typer.Exit(code=1)
@@ -73,7 +117,7 @@ def start(
     """Run the management server in the foreground."""
     active = _load_config(config)
     if is_running(active):
-        typer.echo("OpenProxy is already running")
+        echo("OpenProxy is already running")
         return
     try:
         if reload:
@@ -85,6 +129,8 @@ def start(
             try:
                 uvicorn.run(
                     "openproxy.main:create_app",
+                    log_config=logging_config(active.logging),
+                    access_log=False,
                     factory=True,
                     reload=True,
                     host=active.server.host,
@@ -98,6 +144,8 @@ def start(
         else:
             uvicorn.run(
                 create_app(active),
+                log_config=logging_config(active.logging),
+                access_log=False,
                 host=active.server.host,
                 port=active.server.port,
                 reload=False,
@@ -111,7 +159,7 @@ def start(
 def config_validate(config: ConfigOption = None) -> None:
     """Validate YAML and all supported settings."""
     _load_config(config)
-    typer.echo("Configuration is valid")
+    echo("Configuration is valid")
 
 
 @config_app.command("show")
@@ -121,6 +169,44 @@ def config_show(config: ConfigOption = None) -> None:
     typer.echo(
         yaml.safe_dump(public_config(active).model_dump(), sort_keys=False), nl=False
     )
+
+
+@app.command()
+def doctor(config: ConfigOption = None) -> None:
+    """Check configuration, runtime and local server readiness."""
+    checks = [
+        Check(
+            "PASS" if sys.version_info >= (3, 12) else "FAIL",
+            f"Python {platform.python_version()}",
+        ),
+        Check("PASS", f"OpenProxy {__version__}"),
+    ]
+    try:
+        active = _load_config(config)
+    except typer.Exit:
+        typer.echo("FAIL Configuration")
+        raise
+    checks.append(Check("PASS", "Configuration"))
+    address = check_address(active.server)
+    checks.append(address)
+    running = is_running(active) if address.status != "FAIL" else False
+    if running:
+        checks.append(Check("PASS", "OpenProxy is running; port belongs to OpenProxy"))
+    else:
+        checks.append(
+            Check("WARN", "OpenProxy is not running or service is not OpenProxy")
+        )
+        if address.status != "FAIL":
+            checks.append(check_port(active.server))
+    if not active.server.is_loopback:
+        checks.append(
+            Check("WARN", "External interface: protect management API access")
+        )
+    for check in checks:
+        if not quiet_mode.get() or check.status != "PASS":
+            typer.echo(f"{check.status} {check.message}")
+    if any(check.status == "FAIL" for check in checks):
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 [project]
 name = "openproxy"
-version = "0.2.0"
+version = "0.2.1"
 description = "Privacy-first local network management and monitoring core"
 readme = "README.md"
 authors = [
