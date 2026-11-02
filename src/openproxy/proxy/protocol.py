@@ -21,7 +21,7 @@ HOP = {
 def headers(items: list[tuple[bytes, bytes]]) -> list[tuple[bytes, bytes]]:
     excluded = HOP.copy()
     for key, value in items:
-        if key.lower() == b"connection":
+        if key.lower() in (b"connection", b"proxy-connection"):
             excluded.update(token.strip().lower() for token in value.split(b","))
     return [(k, v) for k, v in items if k.lower() not in excluded]
 
@@ -29,12 +29,22 @@ def headers(items: list[tuple[bytes, bytes]]) -> list[tuple[bytes, bytes]]:
 async def event(
     connection: h11.Connection, reader: asyncio.StreamReader, timeout: float
 ) -> Any:
-    while True:
-        item = connection.next_event()
-        if item is not h11.NEED_DATA:
-            return item
-        data = await asyncio.wait_for(reader.read(65536), timeout)
-        connection.receive_data(data)
+    # One deadline for the whole event, not a fresh timeout for each TCP byte.
+    async with asyncio.timeout(timeout):
+        while True:
+            item = connection.next_event()
+            if item is not h11.NEED_DATA:
+                if isinstance(
+                    item, (h11.Request, h11.Response, h11.InformationalResponse)
+                ):
+                    size = sum(len(k) + len(v) + 4 for k, v in item.headers)
+                    if isinstance(item, h11.Request):
+                        size += len(item.target)
+                    if len(item.headers) > 100 or size > 16384:
+                        raise h11.RemoteProtocolError("Header limits exceeded")
+                return item
+            data = await reader.read(16384)
+            connection.receive_data(data)
 
 
 async def send(

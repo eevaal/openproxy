@@ -68,6 +68,7 @@ class ProxyConfig(ServerConfig):
     port: int = Field(default=8080, ge=1, le=65535)
     connect_timeout: float = Field(default=10, gt=0, le=300)
     read_timeout: float = Field(default=30, gt=0, le=3600)
+    request_timeout: float = Field(default=300, gt=0, le=86400)
     shutdown_timeout: float = Field(default=5, gt=0, le=60)
     max_connections: int = Field(default=100, ge=1, le=10000)
     unmatched_action: Literal["block", "forward"] = "block"

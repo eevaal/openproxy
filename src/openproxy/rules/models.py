@@ -1,5 +1,7 @@
 """Strict declarative rules; paths are compared in encoded HTTP form."""
 
+import json
+import re
 from ipaddress import ip_address
 from typing import Literal
 
@@ -7,11 +9,17 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 
 def normalize_host(host: str) -> str:
-    value = host.rstrip(".").lower()
+    value = host.removesuffix(".").lower()
     try:
         return str(ip_address(value))
     except ValueError:
-        return value.encode("idna").decode("ascii")
+        value = value.encode("idna").decode("ascii")
+        if len(value) > 253 or not all(
+            re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+            for label in value.split(".")
+        ):
+            raise ValueError("invalid DNS host") from None
+        return value
 
 
 class StrictModel(BaseModel):
@@ -43,6 +51,15 @@ class Response(StrictModel):
 
     @model_validator(mode="after")
     def valid(self) -> "Response":
+        names = [key.lower() for key in self.headers]
+        if len(set(names)) != len(names):
+            raise ValueError("duplicate response header")
+        try:
+            if isinstance(self.body, str):
+                self.body.encode("utf-8")
+            json.dumps(self.body, allow_nan=False).encode("utf-8")
+        except (ValueError, UnicodeError):
+            raise ValueError("body must be valid finite UTF-8 JSON or text") from None
         for name, value in self.headers.items():
             if (
                 not name

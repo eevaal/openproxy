@@ -20,7 +20,7 @@ async def respond(
         if isinstance(response.body, str)
         else b""
         if response.body is None
-        else json.dumps(response.body).encode()
+        else json.dumps(response.body, allow_nan=False).encode()
     )
     items = headers(
         [
@@ -33,7 +33,7 @@ async def respond(
         items.append(
             (
                 b"content-type",
-                b"text/plain"
+                b"text/plain; charset=utf-8"
                 if isinstance(response.body, str)
                 else b"application/json",
             )

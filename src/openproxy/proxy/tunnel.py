@@ -26,7 +26,7 @@ async def tunnel(
         )
         if initial:
             upstream_writer.write(initial)
-            await upstream_writer.drain()
+            await asyncio.wait_for(upstream_writer.drain(), settings.read_timeout)
 
         async def pump(
             source: asyncio.StreamReader, destination: asyncio.StreamWriter

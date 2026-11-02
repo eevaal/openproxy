@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-from urllib.parse import urlsplit
 
 import h11
 from pydantic import BaseModel
@@ -12,6 +11,7 @@ from openproxy.proxy.forward import forward
 from openproxy.proxy.network import close
 from openproxy.proxy.protocol import event, send
 from openproxy.proxy.responses import respond
+from openproxy.proxy.targets import authority, http_target
 from openproxy.proxy.tunnel import tunnel
 from openproxy.rules.engine import select_rule
 from openproxy.rules.models import Response
@@ -44,7 +44,9 @@ class ProxyServer:
     def status(self) -> ProxyStatus:
         return ProxyStatus(
             enabled=self.config.proxy.enabled,
-            running=self.listener is not None and self.listener.is_serving(),
+            running=not self.stopping
+            and self.listener is not None
+            and self.listener.is_serving(),
         )
 
     async def start(self) -> None:
@@ -77,9 +79,19 @@ class ProxyServer:
         if self.stopping:
             writer.close()
             return
+        if len(self.tasks) >= self.config.proxy.max_connections + 16:
+            self.stats.total_connections += 1
+            writer.transport.abort()
+            return  # Bound rejection tasks as well as active exchanges.
         task = asyncio.create_task(self.handle(reader, writer))
         self.tasks.add(task)
-        task.add_done_callback(self.tasks.discard)
+        task.add_done_callback(self.finished)
+
+    def finished(self, task: asyncio.Task[None]) -> None:
+        self.tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            self.stats.errors += 1
+            logger.error("Proxy task failed")  # Never expose exception/peer details.
 
     async def handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -91,137 +103,129 @@ class ProxyServer:
                 b"Content-Length: 0\r\nConnection: close\r\n\r\n"
             )
             try:
-                await writer.drain()
+                await asyncio.wait_for(writer.drain(), 0.1)
                 writer.write_eof()
                 await asyncio.wait_for(reader.read(16384), 0.1)
             except (OSError, TimeoutError):
                 logger.debug("Rejected peer closed")
-            await close(writer)
+            finally:
+                await close(writer)
             return
         self.stats.active_connections += 1
         connection = h11.Connection(h11.SERVER, max_incomplete_event_size=16384)
         settings = self.config.proxy
+        started = False
         try:
-            request = await event(connection, reader, settings.read_timeout)
-            if not isinstance(request, h11.Request):
-                raise ValueError("Expected request")
-            raw = list(request.headers)
-            if any(k == b"content-length" for k, _ in raw) and any(
-                k == b"transfer-encoding" for k, _ in raw
-            ):
-                raise ValueError("Ambiguous framing")
-            method = request.method.decode("ascii")
-            if method == "CONNECT":
-                target = urlsplit("//" + request.target.decode("ascii"))
-                if (
-                    not target.hostname
-                    or target.port is None
-                    or target.path
-                    or target.query
-                    or target.username
+            async with asyncio.timeout(settings.request_timeout):
+                request = await event(connection, reader, settings.read_timeout)
+                if not isinstance(request, h11.Request):
+                    raise ValueError("Expected request")
+                raw = list(request.headers)
+                if any(k == b"content-length" for k, _ in raw) and any(
+                    k == b"transfer-encoding" for k, _ in raw
                 ):
-                    raise ValueError("Invalid CONNECT authority")
-                if (
-                    target.port not in settings.allowed_connect_ports
-                    or settings.unmatched_action != "forward"
-                ):
-                    raise PermissionError("CONNECT denied")
-                self.stats.forwarded_requests += 1
-                await tunnel(
-                    connection,
-                    reader,
-                    writer,
-                    target.hostname,
-                    target.port,
-                    connection.trailing_data[0],
-                    settings,
+                    raise ValueError("Ambiguous framing")
+                authority(
+                    next((v for k, v in raw if k == b"host"), b"").decode("ascii")
                 )
-                return
-            if method not in {
-                "GET",
-                "POST",
-                "PUT",
-                "PATCH",
-                "DELETE",
-                "HEAD",
-                "OPTIONS",
-            }:
-                raise ValueError("Unsupported method")
-            target = urlsplit(request.target.decode("ascii"))
-            if target.scheme:
-                if target.scheme != "http" or not target.netloc:
-                    raise ValueError("Only HTTP absolute targets")
-            else:
-                if not request.target.startswith(b"/"):
-                    raise ValueError("Invalid target")
-                host = next(v for k, v in raw if k == b"host").decode("ascii")
-                target = urlsplit("http://" + host + request.target.decode("ascii"))
-            if (
-                not target.hostname
-                or target.username
-                or target.password
-                or target.fragment
-            ):
-                raise ValueError("Invalid target")
-            port = target.port or 80
-            if not 1 <= port <= 65535:
-                raise ValueError("Invalid port")
-            rule = select_rule(
-                self.config.rules,
-                method,
-                target.hostname,
-                target.path or "/",
-                target.query,
-            )
-            action = rule.action if rule else settings.unmatched_action
-            if rule:
-                logger.debug("Rule applied: %s", rule.id)
-            if action != "forward":
-                if any(k == b"expect" for k, _ in raw):
-                    await send(
-                        connection,
-                        writer,
-                        h11.InformationalResponse(status_code=100, headers=[]),
-                        settings.read_timeout,
+                method = request.method.decode("ascii")
+                if method == "CONNECT":
+                    host, port = authority(
+                        request.target.decode("ascii"), explicit_port=True
                     )
-                while True:
-                    part = await event(connection, reader, settings.read_timeout)
-                    if isinstance(part, h11.EndOfMessage):
-                        break
-                    if not isinstance(part, h11.Data):
-                        raise h11.RemoteProtocolError("Incomplete request body")
-                if action == "mock":
-                    self.stats.mock_responses += 1
+                    if any(
+                        k == b"transfer-encoding"
+                        or (k == b"content-length" and v != b"0")
+                        for k, v in raw
+                    ):
+                        raise ValueError("CONNECT cannot have an HTTP body")
+                    if (
+                        port not in settings.allowed_connect_ports
+                        or settings.unmatched_action != "forward"
+                    ):
+                        raise PermissionError("CONNECT denied")
+                    self.stats.forwarded_requests += 1
+                    await tunnel(
+                        connection,
+                        reader,
+                        writer,
+                        host,
+                        port,
+                        connection.trailing_data[0],
+                        settings,
+                    )
+                    return
+                if method not in {
+                    "GET",
+                    "POST",
+                    "PUT",
+                    "PATCH",
+                    "DELETE",
+                    "HEAD",
+                    "OPTIONS",
+                }:
+                    raise ValueError("Unsupported method")
+                host_header = next((v for k, v in raw if k == b"host"), b"")
+                target, host, port = http_target(request.target, host_header)
+                rule = select_rule(
+                    self.config.rules,
+                    method,
+                    host,
+                    target.path or "/",
+                    target.query,
+                )
+                action = rule.action if rule else settings.unmatched_action
+                if rule:
+                    logger.debug("Rule applied: %s", rule.id)
+                if action != "forward":
+                    if any(k == b"expect" for k, _ in raw):
+                        await send(
+                            connection,
+                            writer,
+                            h11.InformationalResponse(status_code=100, headers=[]),
+                            settings.read_timeout,
+                        )
+                    while True:
+                        part = await event(connection, reader, settings.read_timeout)
+                        if isinstance(part, h11.EndOfMessage):
+                            break
+                        if not isinstance(part, h11.Data):
+                            raise h11.RemoteProtocolError("Incomplete request body")
+                    if action == "mock":
+                        self.stats.mock_responses += 1
+                    else:
+                        self.stats.blocked_requests += 1
+                    response = (
+                        rule.response
+                        if rule and rule.response
+                        else Response(status=403)
+                    )
+                    started = True
+                    await respond(
+                        connection, writer, response, method, settings.read_timeout
+                    )
                 else:
-                    self.stats.blocked_requests += 1
-                response = (
-                    rule.response if rule and rule.response else Response(status=403)
-                )
-                await respond(
-                    connection, writer, response, method, settings.read_timeout
-                )
-            else:
-                if any(k == b"expect" for k, _ in raw):
-                    await send(
+                    if any(k == b"expect" for k, _ in raw):
+                        await send(
+                            connection,
+                            writer,
+                            h11.InformationalResponse(status_code=100, headers=[]),
+                            settings.read_timeout,
+                        )
+                    self.stats.forwarded_requests += 1
+                    path = target.path or "/"
+                    if target.query:
+                        path += "?" + target.query
+                    await forward(
+                        request,
                         connection,
+                        reader,
                         writer,
-                        h11.InformationalResponse(status_code=100, headers=[]),
-                        settings.read_timeout,
+                        host,
+                        port,
+                        path,
+                        settings,
                     )
-                self.stats.forwarded_requests += 1
-                path = target.path or "/"
-                if target.query:
-                    path += "?" + target.query
-                await forward(
-                    request,
-                    connection,
-                    reader,
-                    writer,
-                    target.hostname,
-                    port,
-                    path,
-                    settings,
-                )
         except (OSError, TimeoutError, ValueError, h11.ProtocolError) as exc:
             self.stats.errors += 1
             code = (
@@ -234,7 +238,7 @@ class ProxyServer:
                 else 502
             )
             logger.warning("Proxy exchange failed (%d)", code)
-            if connection.our_state in (h11.IDLE, h11.ERROR):
+            if connection.our_state is h11.IDLE and not started:
                 writer.write(
                     (
                         f"HTTP/1.1 {code} Error\r\n"
@@ -253,5 +257,7 @@ class ProxyServer:
                 except (OSError, TimeoutError, h11.ProtocolError):
                     logger.debug("Peer closed during error response")
         finally:
-            await close(writer)
-            self.stats.active_connections -= 1
+            try:
+                await close(writer)
+            finally:
+                self.stats.active_connections -= 1
