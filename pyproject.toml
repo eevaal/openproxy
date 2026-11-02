@@ -1,7 +1,7 @@
 [project]
 name = "openproxy"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.2.0"
+description = "Privacy-first local network management and monitoring core"
 readme = "README.md"
 authors = [
     { name = "Ruslan", email = "realnoates@icloud.com" }
@@ -28,4 +28,19 @@ dev = [
     "mypy>=2.4.1",
     "pytest>=9.2.0",
     "ruff>=0.17.3",
+    "types-PyYAML>=6.0.12",
 ]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
