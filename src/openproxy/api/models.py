@@ -20,7 +20,7 @@ class InfoResponse(BaseModel):
     version: str
     description: str = "Local network management and monitoring core"
     telemetry_enabled: Literal[False] = False
-    proxy_implemented: Literal[False] = False
+    proxy_implemented: Literal[True] = True
 
 
 class PublicServerConfig(BaseModel):

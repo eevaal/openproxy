@@ -11,6 +11,7 @@ from openproxy import __version__
 from openproxy.api.routes import health_router, v1_router
 from openproxy.core.config import AppConfig, load_config
 from openproxy.core.logging import configure_logging
+from openproxy.proxy.server import ProxyServer
 
 EXTERNAL_WARNING = (
     "OpenProxy is listening on a non-loopback interface. The management API has "
@@ -33,10 +34,15 @@ def create_app(
         application.state.config = active
         if not active.server.is_loopback:
             logging.getLogger("openproxy").warning(EXTERNAL_WARNING)
+        proxy = ProxyServer(active)
+        application.state.proxy = proxy
         try:
+            await proxy.start()
             logger.info("Server ready")
             yield
         finally:
+            await proxy.stop()
+            del application.state.proxy
             logger.info("Server stopped")
             del application.state.config
 

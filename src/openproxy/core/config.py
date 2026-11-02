@@ -6,7 +6,16 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
+
+from openproxy.rules.models import Rule
 
 CONFIG_ENV = "OPENPROXY_CONFIG"
 
@@ -54,11 +63,45 @@ class LoggingConfig(BaseModel):
     format: Literal["text", "json"] = "text"
 
 
+class ProxyConfig(ServerConfig):
+    enabled: bool = False
+    port: int = Field(default=8080, ge=1, le=65535)
+    connect_timeout: float = Field(default=10, gt=0, le=300)
+    read_timeout: float = Field(default=30, gt=0, le=3600)
+    shutdown_timeout: float = Field(default=5, gt=0, le=60)
+    max_connections: int = Field(default=100, ge=1, le=10000)
+    unmatched_action: Literal["block", "forward"] = "block"
+    allowed_connect_ports: list[int] = Field(default_factory=lambda: [443])
+    allow_private_targets: bool = False
+    allow_external_bind: bool = False
+
+    @model_validator(mode="after")
+    def valid_proxy(self) -> "ProxyConfig":
+        if any(
+            type(p) is not int or not 1 <= p <= 65535
+            for p in self.allowed_connect_ports
+        ):
+            raise ValueError("CONNECT ports must be between 1 and 65535")
+        if self.enabled and not self.is_loopback and not self.allow_external_bind:
+            raise ValueError("external proxy requires allow_external_bind")
+        return self
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
     server: ServerConfig = Field(default_factory=ServerConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    proxy: ProxyConfig = Field(default_factory=ProxyConfig)
+    rules: list[Rule] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def valid(self) -> "AppConfig":
+        if self.proxy.enabled and self.proxy.port == self.server.port:
+            raise ValueError("API and proxy ports must differ")
+        if len({rule.id for rule in self.rules}) != len(self.rules):
+            raise ValueError("rule IDs must be unique")
+        return self
 
 
 def resolve_config_path(file_path: str | Path | None = None) -> Path | None:

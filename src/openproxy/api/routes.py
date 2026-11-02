@@ -7,6 +7,7 @@ from openproxy.api.models import (
     InfoResponse,
     public_config,
 )
+from openproxy.proxy.server import ProxyStatus, Stats
 
 health_router = APIRouter()
 v1_router = APIRouter(prefix="/api/v1")
@@ -31,3 +32,13 @@ async def info() -> InfoResponse:
 @v1_router.get("/config", response_model=ConfigResponse)
 async def config(request: Request) -> ConfigResponse:
     return public_config(request.app.state.config)
+
+
+@v1_router.get("/proxy/status", response_model=ProxyStatus)
+async def proxy_status(request: Request) -> ProxyStatus:
+    return request.app.state.proxy.status()  # type: ignore[no-any-return]
+
+
+@v1_router.get("/proxy/stats", response_model=Stats)
+async def proxy_stats(request: Request) -> Stats:
+    return request.app.state.proxy.stats.model_copy()  # type: ignore[no-any-return]

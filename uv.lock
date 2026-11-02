@@ -387,10 +387,11 @@ wheels = [
 
 [[package]]
 name = "openproxy"
-version = "0.2.1"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
+    { name = "h11" },
     { name = "httpx" },
     { name = "pydantic" },
     { name = "pyyaml" },
@@ -409,6 +410,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.162.0" },
+    { name = "h11", specifier = ">=0.16.0" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "pydantic", specifier = ">=2.14.2" },
     { name = "pyyaml", specifier = ">=6.0.3" },

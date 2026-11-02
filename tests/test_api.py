@@ -27,7 +27,7 @@ def test_api_and_lifespan() -> None:
         assert info["name"] == "OpenProxy"
         assert info["version"] == __version__
         assert info["telemetry_enabled"] is False
-        assert info["proxy_implemented"] is False
+        assert info["proxy_implemented"] is True
         response = client.get("/api/v1/config")
         assert response.status_code == 200
         assert response.json() == {

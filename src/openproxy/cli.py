@@ -97,11 +97,42 @@ def version() -> None:
     typer.echo(f"OpenProxy version {__version__}")
 
 
+def proxy_check(active: AppConfig, running: bool) -> Check:
+    if not active.proxy.enabled:
+        return Check("PASS", "Proxy disabled")
+    if not running:
+        result = check_port(active.proxy)
+        return Check(result.status, "Proxy port: " + result.message)
+    try:
+        with httpx.Client(trust_env=False, timeout=2, follow_redirects=False) as client:
+            url = (
+                active.server.health_url.removesuffix("/health")
+                + "/api/v1/proxy/status"
+            )
+            response = client.get(url)
+        data = response.json()
+        if (
+            response.status_code == 200
+            and data.get("enabled") is True
+            and data.get("running") is True
+        ):
+            return Check("PASS", "Proxy running")
+    except (httpx.RequestError, ValueError, AttributeError):
+        return Check("FAIL", "Proxy status unavailable")
+    return Check("FAIL", "Proxy not running")
+
+
 @app.command()
 def status(config: ConfigOption = None) -> None:
     """Check the configured instance (exit 1 when unavailable)."""
-    if is_running(_load_config(config)):
+    active = _load_config(config)
+    if is_running(active):
         echo("OpenProxy is running")
+        check = proxy_check(active, True)
+        if not quiet_mode.get() or check.status != "PASS":
+            typer.echo(f"{check.status} {check.message}")
+        if check.status == "FAIL":
+            raise typer.Exit(code=1)
     else:
         typer.echo("OpenProxy is not running or the service is not OpenProxy")
         raise typer.Exit(code=1)
@@ -117,6 +148,10 @@ def start(
     """Run the management server in the foreground."""
     active = _load_config(config)
     if is_running(active):
+        check = proxy_check(active, True)
+        if check.status == "FAIL":
+            typer.echo(f"FAIL {check.message}", err=True)
+            raise typer.Exit(code=1)
         echo("OpenProxy is already running")
         return
     try:
@@ -202,6 +237,7 @@ def doctor(config: ConfigOption = None) -> None:
         checks.append(
             Check("WARN", "External interface: protect management API access")
         )
+    checks.append(proxy_check(active, running))
     for check in checks:
         if not quiet_mode.get() or check.status != "PASS":
             typer.echo(f"{check.status} {check.message}")

@@ -1,0 +1,25 @@
+# Local HTTP mocking; unmatched requests and private upstreams remain blocked.
+server:
+  host: 127.0.0.1
+  port: 8000
+proxy:
+  enabled: true
+  host: 127.0.0.1
+  port: 8080
+  unmatched_action: block
+logging:
+  level: INFO
+  format: text
+rules:
+  - id: example-status
+    match:
+      method: GET
+      host: api.example.test
+      path: /status
+    action: mock
+    response:
+      status: 200
+      headers:
+        Content-Type: application/json
+      body:
+        success: true
