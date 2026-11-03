@@ -222,6 +222,10 @@ def doctor(config: ConfigOption = None) -> None:
         typer.echo("FAIL Configuration")
         raise
     checks.append(Check("PASS", "Configuration"))
+    if active.proxy.https_inspection.enabled:
+        checks.append(
+            Check("PASS", "HTTPS inspection certificate, key and trust configuration")
+        )
     address = check_address(active.server)
     checks.append(address)
     running = is_running(active) if address.status != "FAIL" else False

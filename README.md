@@ -1,4 +1,4 @@
-# OpenProxy v0.3.1
+# OpenProxy v0.4.0
 
 [Русский](README.md) | [English](README.en.md) | [简体中文](README.zh-CN.md)
 
@@ -130,12 +130,83 @@ curl --noproxy '' --proxy http://127.0.0.1:8080 https://example.com
 ```
 
 Внешний пример требует разрешённого forwarding и сетевого доступа; тесты проекта
-его не выполняют. CONNECT разрешён только при unmatched_action: forward и к
+его не выполняют. Обычный CONNECT разрешён только при unmatched_action: forward и к
 allowed_connect_ports. TCP-туннель передаёт байты в обе стороны, поддерживает
 half-close, не расшифровывает TLS и не меняет сертификаты. Path/method/query
-внутри TLS недоступны Rule Engine. HTTPS mocking не реализован. Будущий явно
-доверенный тестовый TLS endpoint может передавать расшифрованный HTTP тому же
-Rule Engine; сейчас такой endpoint отсутствует, скрытого MITM нет.
+внутри обычного туннеля недоступны Rule Engine.
+
+## HTTPS inspection для тестовых клиентов
+
+Включите `proxy.https_inspection.enabled` и перечислите точные DNS-имена в
+`hosts`. Inspection требует включённого loopback-прокси. Для inspection
+адрес `localhost` привязывается к 127.0.0.1. Все CONNECT, включая
+inspection, проходят проверку `allowed_connect_ports`. Для имён вне
+списка продолжает действовать обычная политика CONNECT. Для имени из
+списка OpenProxy принимает CONNECT даже при `unmatched_action: block`,
+устанавливает TLS с клиентом и применяет правила к расшифрованному HTTP.
+
+Укажите PEM-сертификат сервера или цепочку в `certificate_file` и локальный
+незашифрованный ключ в `private_key_file` с правами 0600 или строже.
+Относительные пути считаются от файла YAML. Сертификат должен быть
+действующим, соответствовать ключу и содержать точный DNS SAN для каждого
+имени. Один сертификат может покрывать несколько имён. CA-ключ для
+inspection не требуется. Настройте доверие только для тестового клиента.
+Клиент с pinning должен быть явно настроен на тестовый сертификат через
+свои штатные настройки.
+
+Проверка TLS 1.2 и 1.3 выполняется OpenSSL. Через ALPN объявляется HTTP/1.1.
+CONNECT authority, SNI и адрес HTTP внутри TLS должны совпадать.
+Каждый inspected CONNECT обслуживает один HTTP-запрос. Таймаут
+`handshake_timeout` по умолчанию равен 5 секундам и входит в общий
+`request_timeout`. Для обычного CONNECT сохраняется TCP half-close.
+
+Если выбран mock, прокси отправляет ответ по TLS-соединению клиента
+после получения запроса. Для forward прокси сначала проверяет результаты
+DNS, затем подключается к проверенному IP. SNI и проверка имени используют
+hostname из CONNECT. Upstream проверяется по системным корням OpenSSL.
+Для локального тестового upstream можно добавить отдельный
+`upstream_ca_file`. Для частного IP также требуется
+`allow_private_targets: true`.
+
+Для smoke test из корня репозитория создайте сертификат с OpenSSL,
+поддерживающим `-addext`. Команда генерации рассчитана на новый каталог
+`certs` и оставляет существующий каталог нетронутым.
+
+```bash
+mkdir -m 700 certs && (
+  umask 077
+  openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+    -subj '/CN=api.example.test' \
+    -addext 'subjectAltName=DNS:api.example.test' \
+    -addext 'basicConstraints=critical,CA:FALSE' \
+    -keyout certs/test.key -out certs/test.crt
+)
+uv run openproxy doctor --config examples/https-mock.yaml
+uv run openproxy start --config examples/https-mock.yaml
+```
+
+В другом терминале запустите запрос. curl проверит сертификат через
+явно переданный `--cacert`.
+
+```bash
+curl --noproxy '' --proxy http://127.0.0.1:8080 \
+  --cacert certs/test.crt -H 'Content-Type: application/json' \
+  --data '{}' https://api.example.test/api/v1/device/check
+curl --noproxy '*' http://127.0.0.1:8000/api/v1/proxy/stats
+```
+
+Ожидается JSON `{"success":true,"status":"active"}`. На свежем процессе
+`https_mock_responses` будет равен 1, а `forwarded_requests` останется 0.
+Пример использует домен `api.example.test` и отдельный локальный ключ.
+[Конфигурация примера](examples/https-mock.yaml)
+
+Если TLS не устанавливается, проверьте SAN, срок действия, доверие клиента,
+SNI и права ключа. `doctor` проверяет файлы и конфигурацию. Счётчики
+`https_inspection_connections`, `https_mock_responses`,
+`tls_handshake_failures` и `https_forwarding_errors` доступны в API
+статистики. HTTPS forwarding возвращает 502 при ошибке проверки
+сертификата upstream. В публичном config view доступны прежние поля
+server и logging.
 
 ## Архитектура
 
@@ -240,7 +311,7 @@ ports. Тесты проверяют streaming, методы, заголовки
 proxy/responses.py → proxy/server.py; затем streaming forward и network.py.
 Существующие CLI/API/config/logging тесты сохранены.
 
-Ограничения: без binary file mocks, keep-alive, HTTPS mocking, постоянной
+Ограничения: без binary file mocks, keep-alive, постоянной
 статистики и UI редактирования правил. Mock тела уже находятся в YAML в памяти;
 не используйте YAML для огромных fixtures. Нет ограничения скорости/общего
 числа запросов во времени. read_timeout — таймаут ожидания очередной порции,

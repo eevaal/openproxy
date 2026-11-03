@@ -2,12 +2,15 @@
 
 import asyncio
 import logging
+import ssl
+from typing import cast
 
 import h11
 from pydantic import BaseModel
 
 from openproxy.core.config import AppConfig
 from openproxy.proxy.forward import forward
+from openproxy.proxy.inspection import build_contexts
 from openproxy.proxy.network import close
 from openproxy.proxy.protocol import event, send
 from openproxy.proxy.responses import respond
@@ -26,6 +29,10 @@ class Stats(BaseModel):
     forwarded_requests: int = 0
     blocked_requests: int = 0
     errors: int = 0
+    https_inspection_connections: int = 0
+    https_mock_responses: int = 0
+    tls_handshake_failures: int = 0
+    https_forwarding_errors: int = 0
 
 
 class ProxyStatus(BaseModel):
@@ -40,6 +47,8 @@ class ProxyServer:
         self.listener: asyncio.Server | None = None
         self.tasks: set[asyncio.Task[None]] = set()
         self.stopping = False
+        self.inspection_contexts: dict[str, ssl.SSLContext] = {}
+        self.upstream_tls: ssl.SSLContext | None = None
 
     def status(self) -> ProxyStatus:
         return ProxyStatus(
@@ -51,8 +60,14 @@ class ProxyServer:
 
     async def start(self) -> None:
         if self.config.proxy.enabled:
+            inspection = self.config.proxy.https_inspection
+            if inspection.enabled:
+                self.inspection_contexts, self.upstream_tls = build_contexts(inspection)
+            host = self.config.proxy.host
+            if inspection.enabled and host == "localhost":
+                host = "127.0.0.1"
             self.listener = await asyncio.start_server(
-                self.accept, self.config.proxy.host, self.config.proxy.port
+                self.accept, host, self.config.proxy.port
             )
             logger.info("Proxy started")
             if not self.config.proxy.is_loopback:
@@ -114,118 +129,58 @@ class ProxyServer:
         self.stats.active_connections += 1
         connection = h11.Connection(h11.SERVER, max_incomplete_event_size=16384)
         settings = self.config.proxy
-        started = False
         try:
             async with asyncio.timeout(settings.request_timeout):
-                request = await event(connection, reader, settings.read_timeout)
-                if not isinstance(request, h11.Request):
-                    raise ValueError("Expected request")
-                raw = list(request.headers)
-                if any(k == b"content-length" for k, _ in raw) and any(
-                    k == b"transfer-encoding" for k, _ in raw
-                ):
-                    raise ValueError("Ambiguous framing")
-                authority(
-                    next((v for k, v in raw if k == b"host"), b"").decode("ascii")
-                )
-                method = request.method.decode("ascii")
-                if method == "CONNECT":
+                request, host_header = await self.read_request(connection, reader)
+                destination = None
+                if request.method == b"CONNECT":
+                    authority(host_header.decode("ascii"))
                     host, port = authority(
                         request.target.decode("ascii"), explicit_port=True
                     )
                     if any(
                         k == b"transfer-encoding"
                         or (k == b"content-length" and v != b"0")
-                        for k, v in raw
+                        for k, v in request.headers
                     ):
                         raise ValueError("CONNECT cannot have an HTTP body")
-                    if (
-                        port not in settings.allowed_connect_ports
-                        or settings.unmatched_action != "forward"
+                    if port not in settings.allowed_connect_ports:
+                        raise PermissionError("CONNECT port denied")
+
+                    context = self.inspection_contexts.get(host)
+                    if context is None:
+                        if settings.unmatched_action != "forward":
+                            raise PermissionError("CONNECT denied")
+                        self.stats.forwarded_requests += 1
+                        await tunnel(
+                            connection,
+                            reader,
+                            writer,
+                            host,
+                            port,
+                            connection.trailing_data[0],
+                            settings,
+                        )
+                        return
+
+                    if authority(host_header.decode("ascii"), default_port=443) != (
+                        host,
+                        port,
                     ):
-                        raise PermissionError("CONNECT denied")
-                    self.stats.forwarded_requests += 1
-                    await tunnel(
-                        connection,
-                        reader,
-                        writer,
-                        host,
-                        port,
-                        connection.trailing_data[0],
-                        settings,
+                        raise PermissionError("Host does not match CONNECT")
+                    if connection.trailing_data[0]:
+                        raise ValueError("Unexpected data before TLS handshake")
+                    if not await self.upgrade(connection, reader, writer, context):
+                        return
+                    destination = (host, port)
+                    connection = h11.Connection(
+                        h11.SERVER, max_incomplete_event_size=16384
                     )
-                    return
-                if method not in {
-                    "GET",
-                    "POST",
-                    "PUT",
-                    "PATCH",
-                    "DELETE",
-                    "HEAD",
-                    "OPTIONS",
-                }:
-                    raise ValueError("Unsupported method")
-                host_header = next((v for k, v in raw if k == b"host"), b"")
-                target, host, port = http_target(request.target, host_header)
-                rule = select_rule(
-                    self.config.rules,
-                    method,
-                    host,
-                    target.path or "/",
-                    target.query,
+                    request, host_header = await self.read_request(connection, reader)
+
+                await self.dispatch(
+                    connection, reader, writer, request, host_header, destination
                 )
-                action = rule.action if rule else settings.unmatched_action
-                if rule:
-                    logger.debug("Rule applied: %s", rule.id)
-                if action != "forward":
-                    if any(k == b"expect" for k, _ in raw):
-                        await send(
-                            connection,
-                            writer,
-                            h11.InformationalResponse(status_code=100, headers=[]),
-                            settings.read_timeout,
-                        )
-                    while True:
-                        part = await event(connection, reader, settings.read_timeout)
-                        if isinstance(part, h11.EndOfMessage):
-                            break
-                        if not isinstance(part, h11.Data):
-                            raise h11.RemoteProtocolError("Incomplete request body")
-                    if action == "mock":
-                        self.stats.mock_responses += 1
-                    else:
-                        self.stats.blocked_requests += 1
-                    response = (
-                        rule.response
-                        if rule and rule.response
-                        else Response(status=403)
-                    )
-                    started = True
-                    await respond(
-                        connection, writer, response, method, settings.read_timeout
-                    )
-                else:
-                    if any(k == b"expect" for k, _ in raw):
-                        await send(
-                            connection,
-                            writer,
-                            h11.InformationalResponse(status_code=100, headers=[]),
-                            settings.read_timeout,
-                        )
-                    self.stats.forwarded_requests += 1
-                    path = target.path or "/"
-                    if target.query:
-                        path += "?" + target.query
-                    await forward(
-                        request,
-                        connection,
-                        reader,
-                        writer,
-                        host,
-                        port,
-                        path,
-                        settings,
-                    )
         except (OSError, TimeoutError, ValueError, h11.ProtocolError) as exc:
             self.stats.errors += 1
             code = (
@@ -238,7 +193,7 @@ class ProxyServer:
                 else 502
             )
             logger.warning("Proxy exchange failed (%d)", code)
-            if connection.our_state is h11.IDLE and not started:
+            if connection.our_state is h11.IDLE:
                 writer.write(
                     (
                         f"HTTP/1.1 {code} Error\r\n"
@@ -261,3 +216,149 @@ class ProxyServer:
                 await close(writer)
             finally:
                 self.stats.active_connections -= 1
+
+    async def read_request(
+        self, connection: h11.Connection, reader: asyncio.StreamReader
+    ) -> tuple[h11.Request, bytes]:
+        request = await event(connection, reader, self.config.proxy.read_timeout)
+        if not isinstance(request, h11.Request):
+            raise ValueError("Expected request")
+        names = {k for k, _ in request.headers}
+        if b"content-length" in names and b"transfer-encoding" in names:
+            raise ValueError("Ambiguous framing")
+        host_header = next((v for k, v in request.headers if k == b"host"), b"")
+        return request, host_header
+
+    async def upgrade(
+        self,
+        connection: h11.Connection,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        context: ssl.SSLContext,
+    ) -> bool:
+        settings = self.config.proxy
+        # Pause the raw transport before checking for plaintext that h11 did
+        # not read. start_tls replaces the protocol and resumes the transport.
+        cast(asyncio.Transport, writer.transport).pause_reading()
+        try:
+            async with asyncio.timeout(0):
+                await reader.read(1)
+        except TimeoutError:
+            pass  # A read that would wait means the buffer was empty.
+        else:
+            raise ValueError("Unexpected data or EOF before TLS handshake")
+        await send(
+            connection,
+            writer,
+            h11.Response(status_code=200, headers=[], reason=b"Connection Established"),
+            settings.read_timeout,
+        )
+        established = False
+        try:
+            await writer.start_tls(
+                context,
+                ssl_handshake_timeout=settings.https_inspection.handshake_timeout,
+                ssl_shutdown_timeout=1,
+            )
+            established = True
+        except (OSError, TimeoutError):
+            self.stats.tls_handshake_failures += 1
+            self.stats.errors += 1
+            logger.debug("Inspection TLS handshake failed")
+        finally:
+            if not established:
+                writer.transport.abort()
+        if established:
+            self.stats.https_inspection_connections += 1
+        return established
+
+    async def dispatch(
+        self,
+        connection: h11.Connection,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        request: h11.Request,
+        host_header: bytes,
+        destination: tuple[str, int] | None,
+    ) -> None:
+        settings = self.config.proxy
+        method = request.method.decode("ascii")
+        if method not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}:
+            raise ValueError("Unsupported method")
+        scheme = "https" if destination is not None else "http"
+        target, host, port = http_target(request.target, host_header, scheme=scheme)
+        if destination is not None and (
+            (host, port) != destination
+            or authority(host_header.decode("ascii"), default_port=443) != destination
+        ):
+            raise PermissionError("HTTPS request authority does not match CONNECT")
+
+        rule = select_rule(
+            self.config.rules, method, host, target.path or "/", target.query
+        )
+        action = rule.action if rule else settings.unmatched_action
+        if rule:
+            logger.debug("Rule applied: %s", rule.id)
+
+        if any(k == b"expect" for k, _ in request.headers):
+            await send(
+                connection,
+                writer,
+                h11.InformationalResponse(status_code=100, headers=[]),
+                settings.read_timeout,
+            )
+
+        if action == "forward":
+            self.stats.forwarded_requests += 1
+            path = target.path or "/"
+            if target.query:
+                path += "?" + target.query
+            tls = None
+            if destination is not None:
+                tls = self.upstream_tls
+                if tls is None:
+                    raise RuntimeError("Inspection upstream context missing")
+            try:
+                await forward(
+                    request,
+                    connection,
+                    reader,
+                    writer,
+                    host,
+                    port,
+                    path,
+                    settings,
+                    tls=tls,
+                )
+            except (OSError, TimeoutError, h11.ProtocolError):
+                if destination is not None:
+                    self.stats.https_forwarding_errors += 1
+                    if (
+                        connection.our_state is h11.SEND_RESPONSE
+                        and connection.their_state is h11.SEND_BODY
+                    ):
+                        # A TLS close while application data is still arriving can
+                        # reset the stream before the client receives the error.
+                        await self.discard_body(connection, reader)
+                raise
+            return
+
+        await self.discard_body(connection, reader)
+        if action == "mock":
+            self.stats.mock_responses += 1
+            if destination is not None:
+                self.stats.https_mock_responses += 1
+        else:
+            self.stats.blocked_requests += 1
+        response = rule.response if rule and rule.response else Response(status=403)
+        await respond(connection, writer, response, method, settings.read_timeout)
+
+    async def discard_body(
+        self, connection: h11.Connection, reader: asyncio.StreamReader
+    ) -> None:
+        while True:
+            part = await event(connection, reader, self.config.proxy.read_timeout)
+            if isinstance(part, h11.EndOfMessage):
+                return
+            if not isinstance(part, h11.Data):
+                raise h11.RemoteProtocolError("Incomplete request body")

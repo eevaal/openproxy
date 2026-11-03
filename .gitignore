@@ -21,3 +21,10 @@ htmlcov/
 
 # Local configuration; share examples/mock.yaml instead
 /settings.yaml
+
+# Local TLS inspection material
+/certs/
+*.key
+*.pem
+*.p12
+*.pfx

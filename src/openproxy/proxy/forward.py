@@ -1,4 +1,5 @@
 import asyncio
+import ssl
 
 import h11
 
@@ -16,8 +17,10 @@ async def forward(
     port: int,
     target: str,
     settings: ProxyConfig,
+    *,
+    tls: ssl.SSLContext | None = None,
 ) -> None:
-    upstream_reader, upstream_writer = await connect(host, port, settings)
+    upstream_reader, upstream_writer = await connect(host, port, settings, tls=tls)
     outgoing = h11.Connection(h11.CLIENT)
     try:
         items = headers(list(request.headers))

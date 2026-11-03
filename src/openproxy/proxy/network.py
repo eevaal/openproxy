@@ -2,13 +2,14 @@
 
 import asyncio
 import socket
+import ssl
 from ipaddress import IPv6Address, ip_address, ip_network
 
 from openproxy.core.config import ProxyConfig
 
 
 async def connect(
-    host: str, port: int, settings: ProxyConfig
+    host: str, port: int, settings: ProxyConfig, *, tls: ssl.SSLContext | None = None
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
     async with asyncio.timeout(settings.connect_timeout):
         answers = await asyncio.get_running_loop().getaddrinfo(
@@ -35,6 +36,17 @@ async def connect(
         last: OSError | None = None
         for family, _, _, _, address in answers:
             try:
+                if tls is not None:
+                    return await asyncio.open_connection(
+                        str(address[0]),
+                        port,
+                        family=family,
+                        flags=socket.AI_NUMERICHOST,
+                        ssl=tls,
+                        server_hostname=host,
+                        ssl_handshake_timeout=settings.https_inspection.handshake_timeout,
+                        ssl_shutdown_timeout=1,
+                    )
                 return await asyncio.open_connection(
                     str(address[0]), port, family=family, flags=socket.AI_NUMERICHOST
                 )

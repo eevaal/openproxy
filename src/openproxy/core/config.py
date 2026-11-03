@@ -15,7 +15,8 @@ from pydantic import (
     model_validator,
 )
 
-from openproxy.rules.models import Rule
+from openproxy.proxy.inspection import InspectionError, build_contexts
+from openproxy.rules.models import Rule, normalize_host
 
 CONFIG_ENV = "OPENPROXY_CONFIG"
 
@@ -63,6 +64,41 @@ class LoggingConfig(BaseModel):
     format: Literal["text", "json"] = "text"
 
 
+class HTTPSInspectionConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    enabled: bool = False
+    hosts: list[str] = Field(default_factory=list, max_length=100)
+    certificate_file: str | None = Field(default=None, min_length=1)
+    private_key_file: str | None = Field(default=None, min_length=1)
+    upstream_ca_file: str | None = Field(default=None, min_length=1)
+    handshake_timeout: float = Field(default=5, gt=0, le=60)
+
+    @field_validator("hosts")
+    @classmethod
+    def valid_hosts(cls, hosts: list[str]) -> list[str]:
+        names = [normalize_host(host) for host in hosts]
+        for name in names:
+            try:
+                ip_address(name)
+            except ValueError:
+                continue
+            raise ValueError("inspection hosts must be DNS names")
+        if len(set(names)) != len(names):
+            raise ValueError("duplicate inspection host")
+        return names
+
+    @model_validator(mode="after")
+    def required_material(self) -> "HTTPSInspectionConfig":
+        if self.enabled and not (
+            self.hosts and self.certificate_file and self.private_key_file
+        ):
+            raise ValueError(
+                "inspection requires hosts, certificate_file and private_key_file"
+            )
+        return self
+
+
 class ProxyConfig(ServerConfig):
     enabled: bool = False
     port: int = Field(default=8080, ge=1, le=65535)
@@ -75,6 +111,9 @@ class ProxyConfig(ServerConfig):
     allowed_connect_ports: list[int] = Field(default_factory=lambda: [443])
     allow_private_targets: bool = False
     allow_external_bind: bool = False
+    https_inspection: HTTPSInspectionConfig = Field(
+        default_factory=HTTPSInspectionConfig
+    )
 
     @model_validator(mode="after")
     def valid_proxy(self) -> "ProxyConfig":
@@ -85,6 +124,8 @@ class ProxyConfig(ServerConfig):
             raise ValueError("CONNECT ports must be between 1 and 65535")
         if self.enabled and not self.is_loopback and not self.allow_external_bind:
             raise ValueError("external proxy requires allow_external_bind")
+        if self.https_inspection.enabled and (not self.enabled or not self.is_loopback):
+            raise ValueError("inspection requires an enabled loopback proxy")
         return self
 
 
@@ -133,10 +174,30 @@ def load_config(file_path: str | Path | None = None) -> AppConfig:
     if not isinstance(data, dict):
         raise ConfigError("Configuration must be a YAML mapping")
     try:
-        return AppConfig.model_validate(data)
+        config = AppConfig.model_validate(data)
     except ValidationError as exc:
         details = "; ".join(
             f"{'.'.join(map(str, error['loc']))}: {error['msg']}"
             for error in exc.errors(include_input=False, include_url=False)
         )
         raise ConfigError(f"Invalid configuration '{path}': {details}") from None
+    inspection = config.proxy.https_inspection
+    if inspection.enabled:
+        paths = {}
+        for name in ("certificate_file", "private_key_file", "upstream_ca_file"):
+            value = getattr(inspection, name)
+            if value is not None:
+                paths[name] = str(path.parent / Path(value).expanduser())
+        inspection = inspection.model_copy(update=paths)
+        try:
+            build_contexts(inspection)
+        except InspectionError as exc:
+            raise ConfigError(f"Invalid HTTPS inspection: {exc}") from None
+        config = config.model_copy(
+            update={
+                "proxy": config.proxy.model_copy(
+                    update={"https_inspection": inspection}
+                )
+            }
+        )
+    return config

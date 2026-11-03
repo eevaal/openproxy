@@ -1,4 +1,4 @@
-# OpenProxy v0.3.1
+# OpenProxy v0.4.0
 
 [Русский](README.md) | [English](README.en.md) | [简体中文](README.zh-CN.md)
 
@@ -120,11 +120,69 @@ curl --noproxy '' --proxy http://127.0.0.1:8080 https://example.com
 ```
 
 以上外部示例需要允许转发并具有网络访问权限，项目测试不会执行该请求。
-CONNECT 仅在 unmatched_action 为 forward 且目标端口位于 allowed_connect_ports
+普通 CONNECT 仅在 unmatched_action 为 forward 且目标端口位于 allowed_connect_ports
 中时允许。TCP 隧道双向传输字节，支持半关闭，不解密 TLS，也不修改证书。
-TLS 内部的 HTTP path/method/query 对 Rule Engine 不可见。本版本不支持 HTTPS
-mock。未来显式受信任的测试 TLS 端点可将解密后的 HTTP 交给同一 Rule Engine，
-但目前没有这样的端点，也没有隐藏的 MITM。
+普通 TLS 隧道内部的 HTTP path/method/query 对 Rule Engine 不可见。
+
+## 受控测试客户端的 HTTPS 检查
+
+启用 `proxy.https_inspection.enabled`，并在 `hosts` 中列出确切的 DNS 名称。
+检查功能仅用于已启用的环回代理。启用检查时，监听地址 `localhost` 会绑定到
+127.0.0.1。所有 CONNECT 仍须使用 `allowed_connect_ports` 允许的端口。
+名单以外的主机遵循原有 CONNECT 策略。对于名单内的主机，即使配置了
+`unmatched_action: block`，OpenProxy 也会接受 CONNECT，与客户端建立 TLS，
+然后对解密后的 HTTP 请求应用规则。
+
+使用 `certificate_file` 提供 PEM 服务器证书或证书链，并通过
+`private_key_file` 指定本地未加密的私钥。私钥权限须为 0600 或更严格。
+相对路径以 YAML 文件所在目录为基准。证书须在有效期内，与私钥匹配，
+并为每个检查主机包含确切的 DNS SAN。一个证书可以包含多个名称。
+请在测试客户端中显式配置证书信任。使用证书固定的客户端需要通过其
+受支持的测试设置来信任或固定测试证书。
+
+检查支持 TLS 1.2 和 1.3，ALPN 声明 HTTP/1.1。CONNECT authority、SNI
+和 TLS 内的 HTTP authority 必须一致。每个检查连接处理一个 HTTP 请求。
+`handshake_timeout` 默认为 5 秒，包含在总 `request_timeout` 内。
+普通 CONNECT 隧道保留 TCP 半关闭行为。
+
+匹配 mock 时，代理在接收请求后通过原 TLS 连接返回响应。转发时，代理检查
+DNS 结果，再连接通过检查的数字 IP。上游 SNI 和主机名校验使用 CONNECT 主机名。
+上游证书按照 OpenSSL 默认信任根进行验证，也可通过 `upstream_ca_file` 添加
+本地测试上游的信任证书。访问私有上游地址还需设置 `allow_private_targets: true`。
+
+在仓库根目录运行以下命令。OpenSSL 需支持 `-addext`。生成命令需要新建
+`certs` 目录，保留已有目录。
+
+```bash
+mkdir -m 700 certs && (
+  umask 077
+  openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+    -subj '/CN=api.example.test' \
+    -addext 'subjectAltName=DNS:api.example.test' \
+    -addext 'basicConstraints=critical,CA:FALSE' \
+    -keyout certs/test.key -out certs/test.crt
+)
+uv run openproxy doctor --config examples/https-mock.yaml
+uv run openproxy start --config examples/https-mock.yaml
+```
+
+在另一个终端发送请求，并通过 `--cacert` 显式指定信任证书。
+
+```bash
+curl --noproxy '' --proxy http://127.0.0.1:8080 \
+  --cacert certs/test.crt -H 'Content-Type: application/json' \
+  --data '{}' https://api.example.test/api/v1/device/check
+curl --noproxy '*' http://127.0.0.1:8000/api/v1/proxy/stats
+```
+
+预期 JSON 为 `{"success":true,"status":"active"}`。在新启动的进程中，
+`https_mock_responses` 应为 1，`forwarded_requests` 应为 0。
+[示例配置](examples/https-mock.yaml)
+
+TLS 失败时请检查 DNS SAN、有效期、客户端信任、SNI 和私钥权限。
+`doctor` 检查证书文件及配置。统计 API 提供 `https_inspection_connections`、
+`https_mock_responses`、`tls_handshake_failures` 和 `https_forwarding_errors`。
+上游证书验证失败返回 502。公开配置视图保留原有 server 和 logging 字段。
 
 ## 架构
 
@@ -219,7 +277,7 @@ tests/test_proxy.py 使用真实的本地 HTTP/TCP 服务器和临时端口，�
 proxy/responses.py → proxy/server.py 的顺序阅读，再学习流式转发和 network.py。
 原有 CLI/API/config/logging 测试均保留。
 
-限制：不支持二进制文件 mock、keep-alive、HTTPS mock、持久化统计或规则编辑 UI。
+限制：不支持二进制文件 mock、keep-alive、持久化统计或规则编辑 UI。
 Mock 响应体来自已加载到内存的 YAML，不适合超大型测试数据。没有速率限制，也不
 限制一段时间内的请求总数。read_timeout 限制等待下一部分数据的时间；另有全局
 request_timeout，默认 300 秒，同样适用于 CONNECT。长时间传输或隧道可将其增至

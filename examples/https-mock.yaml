@@ -1,0 +1,25 @@
+# Supply test-only TLS material in the ignored certs/ directory.
+proxy:
+  enabled: true
+  unmatched_action: block
+  https_inspection:
+    enabled: true
+    hosts: [api.example.test]
+    certificate_file: ../certs/test.crt
+    private_key_file: ../certs/test.key
+
+rules:
+  - id: device-check
+    priority: 100
+    match:
+      host: api.example.test
+      method: POST
+      path: /api/v1/device/check
+    action: mock
+    response:
+      status: 200
+      headers:
+        Content-Type: application/json
+      body:
+        success: true
+        status: active

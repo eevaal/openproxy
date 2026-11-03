@@ -6,7 +6,9 @@ from urllib.parse import SplitResult, urlsplit
 from openproxy.rules.models import normalize_host
 
 
-def authority(value: str, *, explicit_port: bool = False) -> tuple[str, int]:
+def authority(
+    value: str, *, explicit_port: bool = False, default_port: int = 80
+) -> tuple[str, int]:
     if (
         not value
         or any(c in value for c in "/?#@\\%")
@@ -32,26 +34,29 @@ def authority(value: str, *, explicit_port: bool = False) -> tuple[str, int]:
         raise ValueError("Explicit port required")
     if value.endswith(":"):
         raise ValueError("Empty port")
-    port = parsed.port if parsed.port is not None else 80
+    port = parsed.port if parsed.port is not None else default_port
     if not 1 <= port <= 65535:
         raise ValueError("Invalid port")
     return host, port
 
 
-def http_target(raw: bytes, host_header: bytes) -> tuple[SplitResult, str, int]:
+def http_target(
+    raw: bytes, host_header: bytes, *, scheme: str = "http"
+) -> tuple[SplitResult, str, int]:
     text = raw.decode("ascii")
     if any(ord(c) <= 32 or ord(c) == 127 for c in text) or "\\" in text or "#" in text:
         raise ValueError("Invalid request target")
-    authority(host_header.decode("ascii"))
+    default_port = 443 if scheme == "https" else 80
+    authority(host_header.decode("ascii"), default_port=default_port)
     if text.startswith("/"):
         # Parse origin-form as a path, even when it begins with //.
         path, separator, query = text.partition("?")
         target = SplitResult(
-            "http", host_header.decode("ascii"), path, query if separator else "", ""
+            scheme, host_header.decode("ascii"), path, query if separator else "", ""
         )
     else:
         target = urlsplit(text)
-        if target.scheme != "http" or not target.netloc:
-            raise ValueError("Only HTTP absolute targets")
-    host, port = authority(target.netloc)
+        if target.scheme != scheme or not target.netloc:
+            raise ValueError("Invalid absolute target scheme")
+    host, port = authority(target.netloc, default_port=default_port)
     return target, host, port

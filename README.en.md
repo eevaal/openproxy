@@ -1,4 +1,4 @@
-# OpenProxy v0.3.1
+# OpenProxy v0.4.0
 
 [Русский](README.md) | [English](README.en.md) | [简体中文](README.zh-CN.md)
 
@@ -130,12 +130,78 @@ curl --noproxy '' --proxy http://127.0.0.1:8080 https://example.com
 ```
 
 This external example requires permitted forwarding and network access; project
-tests do not run it. CONNECT requires `unmatched_action: forward` and a port in
+tests do not run it. Ordinary CONNECT requires `unmatched_action: forward` and a port in
 `allowed_connect_ports`. The bidirectional TCP tunnel supports half-close,
 does not decrypt TLS and does not modify certificates. HTTP path/method/query
-inside TLS are invisible to the Rule Engine. HTTPS mocking is not implemented.
-A future explicitly trusted test TLS endpoint could feed decrypted HTTP to the
-same Rule Engine; no such endpoint or hidden MITM exists now.
+inside an ordinary TLS tunnel are invisible to the Rule Engine.
+
+## HTTPS inspection for test clients
+
+Enable `proxy.https_inspection.enabled` and list exact DNS names under `hosts`.
+Inspection requires an enabled loopback proxy. In inspection mode, a
+`localhost` bind uses 127.0.0.1. All CONNECT requests must use a port in
+`allowed_connect_ports`. Hosts outside the list follow the ordinary CONNECT
+policy. For a listed host, OpenProxy accepts CONNECT even with
+`unmatched_action: block`, establishes TLS with the client and applies the
+rules to the decrypted HTTP request.
+
+Set `certificate_file` to a PEM server certificate or chain and
+`private_key_file` to its local unencrypted key. Use permissions 0600 or
+stricter for the key. Relative paths are relative to the YAML file. The
+certificate must be valid, match the key and contain an exact DNS SAN for
+each listed host. A single certificate can cover several names. Configure
+trust explicitly in the test client. A client with certificate pinning
+requires a supported test configuration that trusts or pins this certificate.
+
+Inspection supports TLS 1.2 and 1.3 and advertises HTTP/1.1 via ALPN. The
+CONNECT authority, SNI and encrypted HTTP authority must agree. Each
+inspected CONNECT carries one HTTP request. The `handshake_timeout` defaults
+to 5 seconds within the overall `request_timeout`. Ordinary CONNECT tunnels
+retain TCP half-close behavior.
+
+On a mock match, the proxy replies on the client's TLS connection once it
+receives the request. For forwarding, it checks the DNS answers and dials a
+checked IP. Upstream SNI and hostname verification use the CONNECT hostname.
+The upstream context verifies certificates against OpenSSL's default roots.
+Set `upstream_ca_file` to add trust for a local test upstream. A private
+upstream IP also requires `allow_private_targets: true`.
+
+Run the smoke test from the repository root with an OpenSSL version that
+supports `-addext`. The generation command requires a new `certs` directory
+and leaves an existing one intact.
+
+```bash
+mkdir -m 700 certs && (
+  umask 077
+  openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+    -subj '/CN=api.example.test' \
+    -addext 'subjectAltName=DNS:api.example.test' \
+    -addext 'basicConstraints=critical,CA:FALSE' \
+    -keyout certs/test.key -out certs/test.crt
+)
+uv run openproxy doctor --config examples/https-mock.yaml
+uv run openproxy start --config examples/https-mock.yaml
+```
+
+In a second terminal, send the request with explicit trust via `--cacert`.
+
+```bash
+curl --noproxy '' --proxy http://127.0.0.1:8080 \
+  --cacert certs/test.crt -H 'Content-Type: application/json' \
+  --data '{}' https://api.example.test/api/v1/device/check
+curl --noproxy '*' http://127.0.0.1:8000/api/v1/proxy/stats
+```
+
+Expect JSON `{"success":true,"status":"active"}`. On a fresh process,
+`https_mock_responses` should be 1 and `forwarded_requests` should be 0.
+[Example configuration](examples/https-mock.yaml)
+
+If TLS fails, check the DNS SAN, validity dates, client trust, SNI and key
+permissions. `doctor` checks the files and configuration. The stats API
+exposes `https_inspection_connections`, `https_mock_responses`,
+`tls_handshake_failures` and `https_forwarding_errors`. An upstream certificate
+verification failure returns 502. The public config view exposes the existing
+server and logging fields.
 
 ## Architecture
 
@@ -242,7 +308,7 @@ connections. Start reading rules/models.py → rules/engine.py → proxy/respons
 → proxy/server.py, then streaming forwarding and network.py. Existing
 CLI/API/config/logging tests remain.
 
-Limitations: no binary file mocks, keep-alive, HTTPS mocking, persistent
+Limitations: no binary file mocks, keep-alive, persistent
 statistics or rule-editing UI. Mock bodies already reside in YAML in memory;
 do not use YAML for huge fixtures. There is no rate limit or total request-count
 limit over time. read_timeout bounds waiting for the next portion; the total
